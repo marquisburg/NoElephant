@@ -1,0 +1,55 @@
+// mdb demo: CLI REPL for the embedded relational database
+//
+// Build from repo root:
+//   build.bat
+
+import "db";
+import "std/io";
+import "std/conv";
+
+export function read_line(buf: cstring, cap: int32) -> int32 {
+  var pos: int32 = 0;
+  while (pos + 1 < cap) {
+    var c: int32 = getchar();
+    if (c == 10) { break; }
+    if (c == 13) { continue; }
+    if (c < 0) { break; }
+    buf[pos] = c;
+    pos = pos + 1;
+  }
+  buf[pos] = 0;
+  return pos;
+}
+
+export function main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) {
+    println_err("usage: db_demo <database_dir>");
+    return 1;
+  }
+  var dir: cstring = argv[1];
+  var opened: DbOpenResult = db_open(dir);
+  if (opened.err != 0) {
+    print_err("open failed: ");
+    println_err(db_error_str(opened.err));
+    return 1;
+  }
+  var db: Db* = opened.db;
+  println("mdb ready. Enter SQL (empty line to quit).");
+  var line: uint8[1024];
+  while (1) {
+    print("mdb> ");
+    var n: int32 = read_line(&line[0], 1024);
+    if (n <= 0) { break; }
+    var result: DbExecResult = db_exec(db, &line[0], n);
+    if (result.err != 0) {
+      print_err("error: ");
+      println_err(db_error_str(result.err));
+    } else {
+      print("ok (");
+      print_int(result.count);
+      println(" rows)");
+    }
+  }
+  db_close(db);
+  return 0;
+}

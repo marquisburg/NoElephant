@@ -1,0 +1,227 @@
+// mdb: page format and cache
+
+import "db_types";
+import "db_io";
+import "db_util";
+import "std/mem";
+
+export function page_header_read(buf: cstring, hdr: PageHeader*) {
+  var b: uint8* = (uint8*)buf;
+  hdr[0].magic = read_u32_le(b, 0);
+  hdr[0].page_id = read_i64_le(b, 8);
+  hdr[0].page_type = read_i32_le(b, 16);
+  hdr[0].checksum = read_u32_le(b, 20);
+  hdr[0].free_offset = read_i32_le(b, 24);
+  hdr[0].slot_count = read_i32_le(b, 28);
+  hdr[0].reserved = 0;
+}
+
+export function page_header_write(buf: cstring, hdr: PageHeader*) {
+  var b: uint8* = (uint8*)buf;
+  write_u32_le(b, 0, hdr[0].magic);
+  write_u32_le(b, 4, 0);
+  write_i64_le(b, 8, hdr[0].page_id);
+  write_i32_le(b, 16, hdr[0].page_type);
+  write_u32_le(b, 20, hdr[0].checksum);
+  write_i32_le(b, 24, hdr[0].free_offset);
+  write_i32_le(b, 28, hdr[0].slot_count);
+}
+
+export function page_validate_buf(buf: cstring) -> int32 {
+  var b: uint8* = (uint8*)buf;
+  if (read_u32_le(b, 0) != db_page_magic()) {
+    return 0;
+  }
+  var stored: uint32 = read_u32_le(b, 20);
+  write_u32_le(b, 20, 0);
+  var computed: uint32 = page_checksum(buf + db_page_header_size(), db_page_size() - db_page_header_size());
+  write_u32_le(b, 20, stored);
+  if (stored != computed) {
+    return 0;
+  }
+  return 1;
+}
+
+export function page_refresh_checksum(buf: cstring) {
+  var b: uint8* = (uint8*)buf;
+  write_u32_le(b, 20, 0);
+  var csum: uint32 = page_checksum(buf + db_page_header_size(), db_page_size() - db_page_header_size());
+  write_u32_le(b, 20, csum);
+}
+
+function cache_slots(db: Db*) -> CacheEntry* {
+  return &db[0].cache[0];
+}
+
+export function cache_data(db: Db*, idx: int32) -> cstring {
+  var slots: CacheEntry* = cache_slots(db);
+  return &slots[idx].data[0];
+}
+
+export function cache_find(db: Db*, page_id: int64) -> int32 {
+  var slots: CacheEntry* = cache_slots(db);
+  var i: int32 = 0;
+  while (i < db_cache_capacity()) {
+    if (slots[i].in_use != 0) {
+      if (slots[i].page_id == page_id) {
+        return i;
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export function cache_evict(db: Db*) -> int32 {
+  var slots: CacheEntry* = cache_slots(db);
+  var i: int32 = 0;
+  while (i < db_cache_capacity()) {
+    if (slots[i].in_use == 0) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+export function cache_flush_entry(db: Db*, idx: int32) -> int32 {
+  if (idx < 0) { return -1; }
+  var slots: CacheEntry* = cache_slots(db);
+  if (slots[idx].in_use == 0) { return 0; }
+  if (slots[idx].dirty == 0) { return 0; }
+  page_refresh_checksum(cache_data(db, idx));
+  var off: int64 = slots[idx].page_id * db_page_size();
+  var n: int64 = db_pwrite(db[0].data_fp, cache_data(db, idx), db_page_size(), off);
+  if (n != db_page_size()) {
+    return -1;
+  }
+  slots[idx].dirty = 0;
+  return 0;
+}
+
+export function cache_flush_all(db: Db*) -> int32 {
+  var i: int32 = 0;
+  while (i < db_cache_capacity()) {
+    var flushed: int32 = cache_flush_entry(db, i);
+    if (flushed != 0) {
+      return -1;
+    }
+    i = i + 1;
+  }
+  if (db_fsync(db[0].data_fp) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+export function cache_load(db: Db*, page_id: int64) -> int32 {
+  var existing: int32 = cache_find(db, page_id);
+  if (existing >= 0) {
+    return existing;
+  }
+  var idx: int32 = cache_evict(db);
+  var flushed: int32 = cache_flush_entry(db, idx);
+  if (flushed != 0) {
+    return -1;
+  }
+  var off: int64 = page_id * db_page_size();
+  var buf: cstring = cache_data(db, idx);
+  var n: int64 = -1;
+  var end: int64 = db_file_size(db[0].data_fp);
+  if (end < 0) { end = 0; }
+  if (off < end) {
+    n = db_pread(db[0].data_fp, buf, db_page_size(), off);
+  }
+  if (n <= 0) {
+    page_init_buf(buf, page_id, 2);
+  } else {
+    var valid: int32 = page_validate_buf(buf);
+    if (valid == 0) {
+      return -1;
+    }
+  }
+  var slots: CacheEntry* = cache_slots(db);
+  slots[idx].page_id = page_id;
+  slots[idx].in_use = 1;
+  slots[idx].dirty = 0;
+  return idx;
+}
+
+export function cache_get_buf(db: Db*, page_id: int64) -> cstring {
+  var idx: int32 = cache_load(db, page_id);
+  if (idx < 0) {
+    return 0;
+  }
+  return cache_data(db, idx);
+}
+
+export function cache_mark_dirty(db: Db*, page_id: int64) {
+  var idx: int32 = cache_find(db, page_id);
+  if (idx >= 0) {
+    cache_slots(db)[idx].dirty = 1;
+  }
+}
+
+export function meta_read(db: Db*) -> int32 {
+  var idx: int32 = cache_load(db, 0);
+  if (idx < 0) { return -1; }
+  var buf: cstring = cache_data(db, idx);
+  var base: int32 = db_page_header_size();
+  var b: uint8* = (uint8*)buf;
+  db[0].next_page_id = read_i64_le(b, base);
+  db[0].next_row_id = read_i64_le(b, base + 8);
+  db[0].wal_lsn = read_i64_le(b, base + 16);
+  db[0].table_count = read_i32_le(b, base + 24);
+  return 0;
+}
+
+export function meta_write(db: Db*) -> int32 {
+  var idx: int32 = cache_load(db, 0);
+  if (idx < 0) { return -1; }
+  var buf: cstring = cache_data(db, idx);
+  page_init_buf(buf, 0, 0);
+  var base: int32 = db_page_header_size();
+  var b: uint8* = (uint8*)buf;
+  write_i64_le(b, base, db[0].next_page_id);
+  write_i64_le(b, base + 8, db[0].next_row_id);
+  write_i64_le(b, base + 16, db[0].wal_lsn);
+  write_i32_le(b, base + 24, db[0].table_count);
+  cache_slots(db)[idx].dirty = 1;
+  page_refresh_checksum(buf);
+  return 0;
+}
+
+export function db_alloc_page(db: Db*, page_type: int32) -> int64 {
+  var pid: int64 = db[0].next_page_id;
+  db[0].next_page_id = db[0].next_page_id + 1;
+  var idx: int32 = cache_load(db, pid);
+  if (idx < 0) { return -1; }
+  page_init_buf(cache_data(db, idx), pid, page_type);
+  cache_slots(db)[idx].dirty = 1;
+  return pid;
+}
+
+export function db_init_new(db: Db*) -> int32 {
+  db[0].next_page_id = 2;
+  db[0].next_row_id = 1;
+  db[0].wal_lsn = 0;
+  db[0].wal_offset = 0;
+  db[0].wal_record_count = 0;
+  db[0].table_count = 0;
+  var slots: CacheEntry* = cache_slots(db);
+  var i: int32 = 0;
+  while (i < db_cache_capacity()) {
+    slots[i].in_use = 0;
+    slots[i].dirty = 0;
+    i = i + 1;
+  }
+  var idx: int32 = cache_load(db, 0);
+  if (idx < 0) { return -1; }
+  page_init_buf(cache_data(db, idx), 0, 0);
+  slots[idx].dirty = 1;
+  var cat: int32 = cache_load(db, 1);
+  if (cat < 0) { return -1; }
+  page_init_buf(cache_data(db, cat), 1, 1);
+  slots[cat].dirty = 1;
+  return meta_write(db);
+}

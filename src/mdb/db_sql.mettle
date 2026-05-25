@@ -1,0 +1,296 @@
+// mdb: minimal SQL lexer/parser
+
+import "db_types";
+import "db_exec";
+import "db_catalog";
+import "std/conv";
+import "std/mem";
+import "std/io";
+
+export function sql_skip_space(s: cstring, len: int32, pos: int32*) {
+  while (pos[0] < len) {
+    if (is_space((int32)(uint8)s[pos[0]]) == 0) { break; }
+    pos[0] = pos[0] + 1;
+  }
+}
+
+export function sql_read_ident(s: cstring, len: int32, pos: int32*, out: cstring, out_cap: int32) -> int32 {
+  sql_skip_space(s, len, pos);
+  var start: int32 = pos[0];
+  var n: int32 = 0;
+  while (pos[0] < len) {
+    var c: int32 = (int32)(uint8)s[pos[0]];
+    if (is_alnum(c) == 0) { if (c != 95) { break; } }
+    if (n + 1 >= out_cap) { return -1; }
+    out[n] = s[pos[0]];
+    n = n + 1;
+    pos[0] = pos[0] + 1;
+  }
+  if (n == 0) { return -1; }
+  out[n] = 0;
+  return n;
+}
+
+export function sql_read_int(s: cstring, len: int32, pos: int32*, out: int64*) -> int32 {
+  var start: int32 = pos[0];
+  var neg: int32 = 0;
+  if (pos[0] < len) {
+    if (s[pos[0]] == 45) {
+      neg = 1;
+      pos[0] = pos[0] + 1;
+    }
+  }
+  var n: int64 = 0;
+  var digits: int32 = 0;
+  while (pos[0] < len) {
+    var c: int32 = (int32)(uint8)s[pos[0]];
+    if (is_digit(c) == 0) { break; }
+    n = n * 10 + (c - 48);
+    digits = digits + 1;
+    pos[0] = pos[0] + 1;
+  }
+  if (digits == 0) { pos[0] = start; return -1; }
+  if (neg != 0) { n = 0 - n; }
+  out[0] = n;
+  return 0;
+}
+
+export function sql_read_string_lit(s: cstring, len: int32, pos: int32*, out: cstring, out_cap: int32) -> int32 {
+  if (pos[0] >= len) { return -1; }
+  if (s[pos[0]] != 39) { return -1; }
+  pos[0] = pos[0] + 1;
+  var n: int32 = 0;
+  while (pos[0] < len) {
+    if (s[pos[0]] == 39) {
+      pos[0] = pos[0] + 1;
+      out[n] = 0;
+      return n;
+    }
+    if (n + 1 >= out_cap) { return -1; }
+    out[n] = s[pos[0]];
+    n = n + 1;
+    pos[0] = pos[0] + 1;
+  }
+  return -1;
+}
+
+export function sql_kw_eq(buf: cstring, n: int32, kw: cstring, kw_len: int32) -> int32 {
+  if (n != kw_len) { return -1; }
+  if (memcmp(buf, kw, n) != 0) { return -1; }
+  return 0;
+}
+
+export function sql_expect_kw(s: cstring, len: int32, pos: int32*, kw: cstring, kw_len: int32) -> int32 {
+  sql_skip_space(s, len, pos);
+  var tmp: uint8[64];
+  var n: int32 = sql_read_ident(s, len, pos, &tmp[0], 64);
+  if (n != kw_len) { return -1; }
+  if (memcmp(&tmp[0], kw, n) != 0) { return -1; }
+  return 0;
+}
+
+export function sql_expect_char(s: cstring, len: int32, pos: int32*, ch: int32) -> int32 {
+  sql_skip_space(s, len, pos);
+  if (pos[0] >= len) { return -1; }
+  if ((int32)(uint8)s[pos[0]] != ch) { return -1; }
+  pos[0] = pos[0] + 1;
+  return 0;
+}
+
+export function sql_parse_value(s: cstring, len: int32, pos: int32*, val: Value*) -> int32 {
+  sql_skip_space(s, len, pos);
+  if (pos[0] >= len) { return -1; }
+  if (s[pos[0]] == 39) {
+    var buf: uint8[256];
+    var n: int32 = sql_read_string_lit(s, len, pos, &buf[0], 256);
+    if (n < 0) { return -1; }
+    var data: cstring = buf_dup(&buf[0], n);
+    if (n > 0 && data == 0) { return -1; }
+    value_set_text(val, data, n);
+    return 0;
+  }
+  var num: int64 = 0;
+  if (sql_read_int(s, len, pos, &num) != 0) { return -1; }
+  value_set_i64(val, num);
+  return 0;
+}
+
+export function sql_exec(db: Db*, sql: cstring, sql_len: int32) -> DbExecResult {
+  var pos: int32 = 0;
+  sql_skip_space(sql, sql_len, &pos);
+  if (pos >= sql_len) { return db_exec_fail(6); }
+
+  var tmp: uint8[64];
+  var n: int32 = sql_read_ident(sql, sql_len, &pos, &tmp[0], 64);
+  if (n < 0) { return db_exec_fail(6); }
+
+  if (sql_kw_eq(&tmp[0], n, "CREATE", 6) == 0) {
+    if (sql_expect_kw(sql, sql_len, &pos, "TABLE", 5) != 0) { return db_exec_fail(6); }
+    var tname: uint8[64];
+    var tlen: int32 = sql_read_ident(sql, sql_len, &pos, &tname[0], 64);
+    if (tlen < 0) { return db_exec_fail(6); }
+    if (sql_expect_kw(sql, sql_len, &pos, "(", 1) != 0) {
+      sql_skip_space(sql, sql_len, &pos);
+      if (pos >= sql_len) { return db_exec_fail(6); }
+      if (sql[pos] != 40) { return db_exec_fail(6); }
+      pos = pos + 1;
+    }
+    var col_names: cstring[16];
+    var col_name_lens: int32[16];
+    var col_types: ColumnType[16];
+    var col_bufs: uint8[1024];
+    var type_bufs: uint8[1024];
+    var col_count: int32 = 0;
+    while (col_count < db_max_columns()) {
+      sql_skip_space(sql, sql_len, &pos);
+      var coff: int32 = col_count * 64;
+      var clen: int32 = sql_read_ident(sql, sql_len, &pos, &col_bufs[coff], 64);
+      if (clen < 0) { return db_exec_fail(6); }
+      col_names[col_count] = &col_bufs[coff];
+      col_name_lens[col_count] = clen;
+      sql_skip_space(sql, sql_len, &pos);
+      var tlen2: int32 = sql_read_ident(sql, sql_len, &pos, &type_bufs[coff], 64);
+      if (tlen2 < 0) { return db_exec_fail(6); }
+      col_types[col_count] = catalog_col_type_from_str(&type_bufs[coff], tlen2);
+      col_count = col_count + 1;
+      sql_skip_space(sql, sql_len, &pos);
+      if (pos < sql_len) {
+        if (sql[pos] == 41) {
+          pos = pos + 1;
+          break;
+        }
+        if (sql[pos] == 44) {
+          pos = pos + 1;
+          continue;
+        }
+      }
+      return db_exec_fail(6);
+    }
+    return exec_create_table(db, &tname[0], tlen, col_count, &col_names[0], &col_name_lens[0], &col_types[0]);
+  }
+
+  if (sql_kw_eq(&tmp[0], n, "INSERT", 6) == 0) {
+    if (sql_expect_kw(sql, sql_len, &pos, "INTO", 4) != 0) { return db_exec_fail(6); }
+    var tname: uint8[64];
+    var tlen: int32 = sql_read_ident(sql, sql_len, &pos, &tname[0], 64);
+    if (tlen < 0) { return db_exec_fail(6); }
+    var tidx: int32 = catalog_find_table(db, &tname[0], tlen);
+    if (tidx < 0) { return db_exec_fail(1); }
+    if (sql_expect_kw(sql, sql_len, &pos, "VALUES", 6) != 0) { return db_exec_fail(6); }
+    sql_skip_space(sql, sql_len, &pos);
+    if (pos >= sql_len) { return db_exec_fail(6); }
+    if (sql[pos] != 40) { return db_exec_fail(6); }
+    pos = pos + 1;
+    var tbl: TableDef* = catalog_get_table(db, tidx);
+    var vals: Value[16];
+    var i: int32 = 0;
+    while (i < tbl[0].col_count) {
+      if (sql_parse_value(sql, sql_len, &pos, &vals[i]) != 0) { return db_exec_fail(6); }
+      sql_skip_space(sql, sql_len, &pos);
+      if (i + 1 < tbl[0].col_count) {
+        if (sql[pos] != 44) { return db_exec_fail(6); }
+        pos = pos + 1;
+      }
+      i = i + 1;
+    }
+    sql_skip_space(sql, sql_len, &pos);
+    if (sql[pos] != 41) { return db_exec_fail(6); }
+    pos = pos + 1;
+    return exec_insert(db, tidx, &vals[0]);
+  }
+
+  if (sql_kw_eq(&tmp[0], n, "SELECT", 6) == 0) {
+    if (sql_expect_char(sql, sql_len, &pos, 42) != 0) { return db_exec_fail(6); }
+    if (sql_expect_kw(sql, sql_len, &pos, "FROM", 4) != 0) { return db_exec_fail(6); }
+    var tname: uint8[64];
+    var tlen: int32 = sql_read_ident(sql, sql_len, &pos, &tname[0], 64);
+    if (tlen < 0) { return db_exec_fail(6); }
+    var tidx: int32 = catalog_find_table(db, &tname[0], tlen);
+    if (tidx < 0) { return db_exec_fail(1); }
+    sql_skip_space(sql, sql_len, &pos);
+    if (pos + 5 <= sql_len) {
+      var wbuf: uint8[64];
+      var wn: int32 = sql_read_ident(sql, sql_len, &pos, &wbuf[0], 64);
+      if (wn == 5) {
+        if (sql_kw_eq(&wbuf[0], 5, "WHERE", 5) == 0) {
+          var cname: uint8[64];
+          var clen: int32 = sql_read_ident(sql, sql_len, &pos, &cname[0], 64);
+          if (clen < 0) { return db_exec_fail(6); }
+          if (sql_expect_kw(sql, sql_len, &pos, "=", 1) != 0) {
+            sql_skip_space(sql, sql_len, &pos);
+            if (pos >= sql_len) { return db_exec_fail(6); }
+            if (sql[pos] != 61) { return db_exec_fail(6); }
+            pos = pos + 1;
+          }
+          var lit: Value = value_none();
+          if (sql_parse_value(sql, sql_len, &pos, &lit) != 0) { return db_exec_fail(6); }
+          var tbl: TableDef* = catalog_get_table(db, tidx);
+          var cidx: int32 = catalog_find_column(tbl, &cname[0], clen);
+          if (cidx < 0) { return db_exec_fail(1); }
+          return exec_select_where(db, tidx, cidx, &lit);
+        }
+      }
+      if (wn > 0) { pos = pos - wn; }
+    }
+    return exec_select_all(db, tidx);
+  }
+
+  if (sql_kw_eq(&tmp[0], n, "DELETE", 6) == 0) {
+    if (sql_expect_kw(sql, sql_len, &pos, "FROM", 4) != 0) { return db_exec_fail(6); }
+    var tname: uint8[64];
+    var tlen: int32 = sql_read_ident(sql, sql_len, &pos, &tname[0], 64);
+    if (tlen < 0) { return db_exec_fail(6); }
+    var tidx: int32 = catalog_find_table(db, &tname[0], tlen);
+    if (tidx < 0) { return db_exec_fail(1); }
+    if (sql_expect_kw(sql, sql_len, &pos, "WHERE", 5) != 0) { return db_exec_fail(6); }
+    var cname: uint8[64];
+    var clen: int32 = sql_read_ident(sql, sql_len, &pos, &cname[0], 64);
+    if (clen < 0) { return db_exec_fail(6); }
+    sql_skip_space(sql, sql_len, &pos);
+    if (sql[pos] != 61) { return db_exec_fail(6); }
+    pos = pos + 1;
+    var lit: Value = value_none();
+    if (sql_parse_value(sql, sql_len, &pos, &lit) != 0) { return db_exec_fail(6); }
+    var tbl: TableDef* = catalog_get_table(db, tidx);
+    var cidx: int32 = catalog_find_column(tbl, &cname[0], clen);
+    if (cidx < 0) { return db_exec_fail(1); }
+    if (cidx != tbl[0].pk_col) { return db_exec_fail(8); }
+    return exec_delete(db, tidx, &lit);
+  }
+
+  if (sql_kw_eq(&tmp[0], n, "UPDATE", 6) == 0) {
+    var tname: uint8[64];
+    var tlen: int32 = sql_read_ident(sql, sql_len, &pos, &tname[0], 64);
+    if (tlen < 0) { return db_exec_fail(6); }
+    var tidx: int32 = catalog_find_table(db, &tname[0], tlen);
+    if (tidx < 0) { return db_exec_fail(1); }
+    if (sql_expect_kw(sql, sql_len, &pos, "SET", 3) != 0) { return db_exec_fail(6); }
+    var cname: uint8[64];
+    var clen: int32 = sql_read_ident(sql, sql_len, &pos, &cname[0], 64);
+    if (clen < 0) { return db_exec_fail(6); }
+    sql_skip_space(sql, sql_len, &pos);
+    if (sql[pos] != 61) { return db_exec_fail(6); }
+    pos = pos + 1;
+    var new_val: Value = value_none();
+    if (sql_parse_value(sql, sql_len, &pos, &new_val) != 0) { return db_exec_fail(6); }
+    if (sql_expect_kw(sql, sql_len, &pos, "WHERE", 5) != 0) { return db_exec_fail(6); }
+    var pkname: uint8[64];
+    var pklen: int32 = sql_read_ident(sql, sql_len, &pos, &pkname[0], 64);
+    if (pklen < 0) { return db_exec_fail(6); }
+    sql_skip_space(sql, sql_len, &pos);
+    if (sql[pos] != 61) { return db_exec_fail(6); }
+    pos = pos + 1;
+    var pkval: Value = value_none();
+    if (sql_parse_value(sql, sql_len, &pos, &pkval) != 0) { return db_exec_fail(6); }
+    var tbl: TableDef* = catalog_get_table(db, tidx);
+    var cidx: int32 = catalog_find_column(tbl, &cname[0], clen);
+    if (cidx < 0) { return db_exec_fail(1); }
+    return exec_update(db, tidx, &pkval, cidx, &new_val);
+  }
+
+  return db_exec_fail(6);
+}
+
+export function db_exec_sql(db: Db*, sql: string) -> DbExecResult {
+  return sql_exec(db, sql.chars, sql.length);
+}

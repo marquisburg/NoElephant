@@ -1,0 +1,34 @@
+// mdb: transactions
+
+import "db_types";
+import "db_wal";
+import "db_page";
+import "db_catalog";
+
+export function tx_begin(db: Db*) -> int32 {
+  if (db[0].in_txn != 0) { return 8; }
+  db[0].in_txn = 1;
+  return 0;
+}
+
+export function tx_commit(db: Db*) -> int32 {
+  if (db[0].in_txn == 0) { return 8; }
+  if (wal_append_commit(db) != 0) { return 4; }
+  if (catalog_save(db) != 0) { return 4; }
+  if (cache_flush_all(db) != 0) { return 4; }
+  if (wal_needs_checkpoint(db) != 0) {
+    if (wal_checkpoint(db) != 0) { return 4; }
+  }
+  db[0].in_txn = 0;
+  return 0;
+}
+
+export function tx_abort(db: Db*) -> int32 {
+  db[0].in_txn = 0;
+  return 0;
+}
+
+export function tx_checkpoint(db: Db*) -> int32 {
+  if (wal_checkpoint(db) != 0) { return 4; }
+  return 0;
+}

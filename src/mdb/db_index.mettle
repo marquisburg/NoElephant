@@ -1,0 +1,134 @@
+// mdb: primary-key hash index
+
+import "db_types";
+import "db_page";
+import "db_util";
+import "std/mem";
+
+export function index_bucket_offset(bucket: int32) -> int32 {
+  return db_page_header_size() + bucket * db_index_entry_size();
+}
+
+export function index_hash_key(val: Value*) -> int64 {
+  if (val[0].tag == 1) { return val[0].i64; }
+  if (val[0].tag == 2) {
+    var h: int64 = 5381;
+    var i: int32 = 0;
+    while (i < val[0].text.length) {
+      h = h * 33 + (int64)(uint8)val[0].text.data[i];
+      i = i + 1;
+    }
+    return h;
+  }
+  return 0;
+}
+
+export function index_read_entry(buf: cstring, bucket: int32, in_use: int32*, key_hash: int64*, row_id: int64*, heap_page_id: int64*, slot: int32*) {
+  var b: uint8* = (uint8*)buf;
+  var base: int32 = index_bucket_offset(bucket);
+  in_use[0] = read_i32_le(b, base);
+  key_hash[0] = read_i64_le(b, base + 4);
+  row_id[0] = read_i64_le(b, base + 12);
+  heap_page_id[0] = read_i64_le(b, base + 20);
+  slot[0] = read_i32_le(b, base + 28);
+}
+
+export function index_write_entry(buf: cstring, bucket: int32, in_use: int32, key_hash: int64, row_id: int64, heap_page_id: int64, slot: int32) {
+  var b: uint8* = (uint8*)buf;
+  var base: int32 = index_bucket_offset(bucket);
+  write_i32_le(b, base, in_use);
+  write_i64_le(b, base + 4, key_hash);
+  write_i64_le(b, base + 12, row_id);
+  write_i64_le(b, base + 20, heap_page_id);
+  write_i32_le(b, base + 28, slot);
+}
+
+export function index_find_bucket(buf: cstring, key_hash: int64) -> int32 {
+  var start: int32 = (int32)(key_hash % db_index_buckets());
+  if (start < 0) { start = 0 - start; }
+  var probe: int32 = 0;
+  while (probe < db_index_buckets()) {
+    var bucket: int32 = (start + probe) % db_index_buckets();
+    var in_use: int32 = 0;
+    var kh: int64 = 0;
+    var row_id: int64 = 0;
+    var heap_page_id: int64 = 0;
+    var slot: int32 = 0;
+    index_read_entry(buf, bucket, &in_use, &kh, &row_id, &heap_page_id, &slot);
+    if (in_use == 0) {
+      return bucket;
+    }
+    if (kh == key_hash) {
+      return bucket;
+    }
+    probe = probe + 1;
+  }
+  return -1;
+}
+
+export function index_insert(db: Db*, index_page_id: int64, pk: Value*, row_id: int64, heap_page_id: int64, slot: int32) -> int32 {
+  var buf: cstring = cache_get_buf(db, index_page_id);
+  if (buf == 0) { return -1; }
+  var key_hash: int64 = index_hash_key(pk);
+  var bucket: int32 = index_find_bucket(buf, key_hash);
+  if (bucket < 0) { return -1; }
+  var in_use: int32 = 0;
+  var kh: int64 = 0;
+  var rid: int64 = 0;
+  var hp: int64 = 0;
+  var sl: int32 = 0;
+  index_read_entry(buf, bucket, &in_use, &kh, &rid, &hp, &sl);
+  if (in_use != 0) {
+    if (kh == key_hash) { return -1; }
+  }
+  index_write_entry(buf, bucket, 1, key_hash, row_id, heap_page_id, slot);
+  page_refresh_checksum(buf);
+  cache_mark_dirty(db, index_page_id);
+  return 0;
+}
+
+export function index_lookup(db: Db*, index_page_id: int64, pk: Value*, ref: RowRef*) -> int32 {
+  var buf: cstring = cache_get_buf(db, index_page_id);
+  if (buf == 0) { return -1; }
+  var key_hash: int64 = index_hash_key(pk);
+  var start: int32 = (int32)(key_hash % db_index_buckets());
+  if (start < 0) { start = 0 - start; }
+  var probe: int32 = 0;
+  while (probe < db_index_buckets()) {
+    var bucket: int32 = (start + probe) % db_index_buckets();
+    var in_use: int32 = 0;
+    var kh: int64 = 0;
+    index_read_entry(buf, bucket, &in_use, &kh, &ref[0].row_id, &ref[0].heap_page_id, &ref[0].slot);
+    if (in_use == 0) { return -1; }
+    if (kh == key_hash) { return 0; }
+    probe = probe + 1;
+  }
+  return -1;
+}
+
+export function index_delete(db: Db*, index_page_id: int64, pk: Value*) -> int32 {
+  var buf: cstring = cache_get_buf(db, index_page_id);
+  if (buf == 0) { return -1; }
+  var key_hash: int64 = index_hash_key(pk);
+  var start: int32 = (int32)(key_hash % db_index_buckets());
+  if (start < 0) { start = 0 - start; }
+  var probe: int32 = 0;
+  while (probe < db_index_buckets()) {
+    var bucket: int32 = (start + probe) % db_index_buckets();
+    var in_use: int32 = 0;
+    var kh: int64 = 0;
+    var row_id: int64 = 0;
+    var heap_page_id: int64 = 0;
+    var slot: int32 = 0;
+    index_read_entry(buf, bucket, &in_use, &kh, &row_id, &heap_page_id, &slot);
+    if (in_use == 0) { return -1; }
+    if (kh == key_hash) {
+      index_write_entry(buf, bucket, 0, 0, 0, 0, 0);
+      page_refresh_checksum(buf);
+      cache_mark_dirty(db, index_page_id);
+      return 0;
+    }
+    probe = probe + 1;
+  }
+  return -1;
+}

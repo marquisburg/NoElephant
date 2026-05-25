@@ -1,0 +1,126 @@
+// mdb: write-ahead log
+
+import "db_types";
+import "db_io";
+import "db_page";
+import "db_util";
+import "std/mem";
+
+export function wal_write_header(buf: cstring, lsn: int64, opcode: int32, payload_len: int32, checksum: uint32) {
+  var b: uint8* = (uint8*)buf;
+  write_u32_le(b, 0, db_wal_magic());
+  write_i64_le(b, 4, lsn);
+  write_i32_le(b, 12, opcode);
+  write_i32_le(b, 16, payload_len);
+  write_u32_le(b, 20, checksum);
+}
+
+export function wal_read_header(buf: cstring, lsn: int64*, opcode: int32*, payload_len: int32*, checksum: uint32*) {
+  var b: uint8* = (uint8*)buf;
+  lsn[0] = read_i64_le(b, 4);
+  opcode[0] = read_i32_le(b, 12);
+  payload_len[0] = read_i32_le(b, 16);
+  checksum[0] = read_u32_le(b, 20);
+}
+
+export function wal_append_raw(db: Db*, opcode: int32, payload: cstring, payload_len: int32) -> int32 {
+  var rec_size: int32 = db_wal_header_size() + payload_len;
+  var buf: cstring = malloc(rec_size);
+  if (buf == 0) { return -1; }
+  db[0].wal_lsn = db[0].wal_lsn + 1;
+  wal_write_header(buf, db[0].wal_lsn, opcode, payload_len, 0);
+  if (payload_len > 0) {
+    memcpy(buf + db_wal_header_size(), payload, payload_len);
+  }
+  var csum: uint32 = page_checksum(buf + db_wal_header_size(), payload_len);
+  wal_write_header(buf, db[0].wal_lsn, opcode, payload_len, csum);
+  var n: int64 = db_pwrite(db[0].wal_fp, buf, rec_size, db[0].wal_offset);
+  free(buf);
+  if (n != rec_size) { return -1; }
+  db[0].wal_offset = db[0].wal_offset + rec_size;
+  db[0].wal_record_count = db[0].wal_record_count + 1;
+  return 0;
+}
+
+export function wal_fsync(db: Db*) -> int32 {
+  return db_fsync(db[0].wal_fp);
+}
+
+export function wal_append_commit(db: Db*) -> int32 {
+  if (wal_append_raw(db, 4, 0, 0) != 0) { return -1; }
+  return wal_fsync(db);
+}
+
+export function wal_truncate(db: Db*) -> int32 {
+  if (db_ftruncate(db[0].wal_fp, 0) != 0) { return -1; }
+  db[0].wal_offset = 0;
+  db[0].wal_record_count = 0;
+  return 0;
+}
+
+export function wal_replay(db: Db*) -> int32 {
+  if (db[0].wal_fp == 0) { return 4; }
+  var off: int64 = 0;
+  var hdr_buf: uint8[24];
+  var last_commit_lsn: int64 = 0;
+  while (off < db[0].wal_offset) {
+    var n: int64 = db_pread(db[0].wal_fp, &hdr_buf[0], db_wal_header_size(), off);
+    if (n != db_wal_header_size()) { break; }
+    var b: uint8* = (uint8*)(&hdr_buf[0]);
+    if (read_u32_le(b, 0) != db_wal_magic()) { return 3; }
+    var lsn: int64 = 0;
+    var opcode: int32 = 0;
+    var payload_len: int32 = 0;
+    var checksum: uint32 = 0;
+    wal_read_header(&hdr_buf[0], &lsn, &opcode, &payload_len, &checksum);
+    if (payload_len < 0) { return 3; }
+    if (payload_len > 4096) { return 3; }
+    var total: int32 = db_wal_header_size() + payload_len;
+    var rec: cstring = malloc(total);
+    if (rec == 0) { return 4; }
+    var rn: int64 = db_pread(db[0].wal_fp, rec, total, off);
+    if (rn != total) {
+      free(rec);
+      break;
+    }
+    wal_write_header(rec, lsn, opcode, payload_len, 0);
+    var computed: uint32 = page_checksum(rec + db_wal_header_size(), payload_len);
+    if (checksum != computed) {
+      free(rec);
+      return 3;
+    }
+    if (opcode == 4) {
+      last_commit_lsn = lsn;
+    }
+    free(rec);
+    off = off + total;
+  }
+  db[0].wal_lsn = last_commit_lsn;
+  return 0;
+}
+
+export function wal_scan_validate(db: Db*) -> int32 {
+  if (db[0].wal_fp == 0) { return 0; }
+  var end: int64 = db_file_size(db[0].wal_fp);
+  if (end < 0) { end = db[0].wal_offset; }
+  db[0].wal_offset = end;
+  return wal_replay(db);
+}
+
+export function wal_checkpoint(db: Db*) -> int32 {
+  if (cache_flush_all(db) != 0) { return -1; }
+  if (meta_write(db) != 0) { return -1; }
+  if (cache_flush_all(db) != 0) { return -1; }
+  if (wal_append_raw(db, 5, 0, 0) != 0) { return -1; }
+  if (wal_fsync(db) != 0) { return -1; }
+  if (wal_truncate(db) != 0) { return -1; }
+  db[0].wal_record_count = 0;
+  return 0;
+}
+
+export function wal_needs_checkpoint(db: Db*) -> int32 {
+  if (db[0].wal_record_count >= db_wal_checkpoint_threshold()) {
+    return 1;
+  }
+  return 0;
+}

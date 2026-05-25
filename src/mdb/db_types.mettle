@@ -1,0 +1,235 @@
+// mdb: core types and constants
+
+import "std/mem";
+export enum ColumnType {
+  Int64 = 0,
+  Text = 1
+}
+
+export enum DbError {
+  NoError = 0,
+  NotFound = 1,
+  AlreadyExists = 2,
+  Corrupt = 3,
+  IOError = 4,
+  Locked = 5,
+  Syntax = 6,
+  Constraint = 7,
+  Invalid = 8
+}
+
+export enum ValueTag {
+  Null = 0,
+  Int64Val = 1,
+  TextVal = 2
+}
+
+export enum PageType {
+  Meta = 0,
+  Catalog = 1,
+  Heap = 2,
+  Index = 3
+}
+
+export enum WalOpcode {
+  WalInsert = 1,
+  WalUpdate = 2,
+  WalDelete = 3,
+  WalCommit = 4,
+  WalCheckpoint = 5
+}
+
+export function db_page_size() -> int32 { return 4096; }
+export function db_page_header_size() -> int32 { return 32; }
+export function db_page_magic() -> uint32 { return 0x4D544442; }
+export function db_wal_magic() -> uint32 { return 0x4D57414C; }
+export function db_wal_header_size() -> int32 { return 24; }
+
+export function db_max_tables() -> int32 { return 8; }
+export function db_max_columns() -> int32 { return 16; }
+export function db_max_name_len() -> int32 { return 63; }
+export function db_cache_capacity() -> int32 { return 32; }
+export function db_alloc_size() -> int64 { return 147456; }
+export function db_index_buckets() -> int32 { return 64; }
+export function db_index_entry_size() -> int32 { return 32; }
+export function db_wal_checkpoint_threshold() -> int32 { return 16; }
+export function db_heap_slot_size() -> int32 { return 8; }
+
+export struct ValueText {
+  data: cstring;
+  length: int32;
+}
+
+// Plain struct instead of tagged enum: Mettle tagged enums misbehave in arrays/pointers.
+export struct Value {
+  tag: ValueTag;
+  i64: int64;
+  text: ValueText;
+}
+
+export function value_none() -> Value {
+  var v: Value;
+  v.tag = 0;
+  v.i64 = 0;
+  v.text.data = 0;
+  v.text.length = 0;
+  return v;
+}
+
+export function value_i64(n: int64) -> Value {
+  var v: Value;
+  v.tag = 1;
+  v.i64 = n;
+  v.text.data = 0;
+  v.text.length = 0;
+  return v;
+}
+
+export function value_text(data: cstring, length: int32) -> Value {
+  var v: Value;
+  v.tag = 2;
+  v.i64 = 0;
+  v.text.data = data;
+  v.text.length = length;
+  return v;
+}
+
+export function value_set_none(v: Value*) {
+  v[0].tag = 0;
+  v[0].i64 = 0;
+  v[0].text.data = 0;
+  v[0].text.length = 0;
+}
+
+export function value_set_i64(v: Value*, n: int64) {
+  v[0].tag = 1;
+  v[0].i64 = n;
+  v[0].text.data = 0;
+  v[0].text.length = 0;
+}
+
+export function value_set_text(v: Value*, data: cstring, length: int32) {
+  v[0].tag = 2;
+  v[0].i64 = 0;
+  v[0].text.data = data;
+  v[0].text.length = length;
+}
+
+export function value_copy_into(dst: Value*, src: Value*) {
+  if (dst[0].tag == 2) {
+    if (dst[0].text.data != 0) { free(dst[0].text.data); }
+  }
+  if (src[0].tag == 0) {
+    value_set_none(dst);
+    return;
+  }
+  if (src[0].tag == 1) {
+    value_set_i64(dst, src[0].i64);
+    return;
+  }
+  if (src[0].tag == 2) {
+    if (src[0].text.length > 0) {
+      var data: cstring = buf_dup(src[0].text.data, src[0].text.length);
+      value_set_text(dst, data, src[0].text.length);
+    } else {
+      value_set_text(dst, 0, 0);
+    }
+  }
+}
+
+export struct DbExecResult {
+  err: DbError;
+  count: int32;
+}
+
+export struct TableDef {
+  name: uint8[64];
+  name_len: int32;
+  col_count: int32;
+  pk_col: int32;
+  heap_page_id: int64;
+  index_page_id: int64;
+  row_count: int64;
+  col_name_lens: int32[16];
+  col_names: uint8[1024];
+  col_types: ColumnType[16];
+}
+
+export struct PageHeader {
+  magic: uint32;
+  page_id: int64;
+  page_type: int32;
+  checksum: uint32;
+  free_offset: int32;
+  slot_count: int32;
+  reserved: int32;
+}
+
+export struct CacheEntry {
+  page_id: int64;
+  dirty: int32;
+  in_use: int32;
+  data: uint8[4096];
+}
+
+export struct Db {
+  dir_path: uint8[512];
+  dir_len: int32;
+  data_path: uint8[512];
+  wal_path: uint8[512];
+  lock_path: uint8[512];
+  data_fp: cstring;
+  wal_fp: cstring;
+  next_page_id: int64;
+  next_row_id: int64;
+  wal_lsn: int64;
+  wal_offset: int64;
+  wal_record_count: int32;
+  table_count: int32;
+  in_txn: int32;
+  tables: TableDef[8];
+  cache: CacheEntry[32];
+}
+
+export struct DbOpenResult {
+  db: Db*;
+  err: DbError;
+}
+
+export function db_exec_ok(count: int32) -> DbExecResult {
+  var r: DbExecResult;
+  r.err = 0;
+  r.count = count;
+  return r;
+}
+
+export function db_exec_fail(err: DbError) -> DbExecResult {
+  var r: DbExecResult;
+  r.err = err;
+  r.count = 0;
+  return r;
+}
+
+export function db_open_fail(err: DbError) -> DbOpenResult {
+  var r: DbOpenResult;
+  r.db = 0;
+  r.err = err;
+  return r;
+}
+
+export function db_alloc() -> Db* {
+  return (Db*)calloc(1, db_alloc_size());
+}
+
+export function db_open_ok(db: Db*) -> DbOpenResult {
+  var r: DbOpenResult;
+  r.db = db;
+  r.err = 0;
+  return r;
+}
+
+export struct RowRef {
+  row_id: int64;
+  heap_page_id: int64;
+  slot: int32;
+}

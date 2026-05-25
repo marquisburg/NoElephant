@@ -1,0 +1,196 @@
+// mdb: CRUD executor
+
+import "db_types";
+import "db_catalog";
+import "db_heap";
+import "db_index";
+import "db_page";
+import "db_tx";
+import "std/io";
+import "std/mem";
+
+export function exec_print_value(val: Value*) {
+  if (val[0].tag == 0) {
+    print("NULL");
+    return;
+  }
+  if (val[0].tag == 1) {
+    print_int(val[0].i64);
+    return;
+  }
+  if (val[0].tag == 2) {
+    var i: int32 = 0;
+    while (i < val[0].text.length) {
+      putchar((int32)(uint8)val[0].text.data[i]);
+      i = i + 1;
+    }
+  }
+}
+
+export function exec_insert(db: Db*, table_idx: int32, vals: Value*) -> DbExecResult {
+  var tbl: TableDef* = catalog_get_table(db, table_idx);
+  if (tbl == 0) { return db_exec_fail(1); }
+  if (tx_begin(db) != 0) { return db_exec_fail(8); }
+  var row_id: int64 = db[0].next_row_id;
+  db[0].next_row_id = db[0].next_row_id + 1;
+  var slot: int32 = 0;
+  if (heap_insert_row(db, tbl[0].heap_page_id, row_id, tbl[0].col_count, vals, &slot) != 0) {
+    tx_abort(db);
+    return db_exec_fail(4);
+  }
+  if (index_insert(db, tbl[0].index_page_id, &vals[tbl[0].pk_col], row_id, tbl[0].heap_page_id, slot) != 0) {
+    tx_abort(db);
+    return db_exec_fail(7);
+  }
+  tbl[0].row_count = tbl[0].row_count + 1;
+  if (tx_commit(db) != 0) {
+    return db_exec_fail(4);
+  }
+  return db_exec_ok(1);
+}
+
+export function exec_select_all(db: Db*, table_idx: int32) -> DbExecResult {
+  var tbl: TableDef* = catalog_get_table(db, table_idx);
+  if (tbl == 0) { return db_exec_fail(1); }
+  var buf: cstring = cache_get_buf(db, tbl[0].heap_page_id);
+  if (buf == 0) { return db_exec_fail(4); }
+  var hdr: PageHeader[1];
+  page_header_read(buf, &hdr[0]);
+  var count: int32 = 0;
+  var slot: int32 = 0;
+  while (slot < hdr[0].slot_count) {
+    var row_id: int64 = 0;
+    var vals: Value[16];
+    var cc: int32 = heap_get_row(buf, slot, &row_id, tbl[0].col_count, &vals[0]);
+    if (cc >= 0) {
+      print("row ");
+      print_int(row_id);
+      print(": ");
+      var i: int32 = 0;
+      while (i < cc) {
+        if (i > 0) { print(", "); }
+        exec_print_value(&vals[i]);
+        i = i + 1;
+      }
+      newline();
+      heap_free_values(cc, &vals[0]);
+      count = count + 1;
+    }
+    slot = slot + 1;
+  }
+  return db_exec_ok(count);
+}
+
+export function exec_select_where(db: Db*, table_idx: int32, col_idx: int32, lit: Value*) -> DbExecResult {
+  var tbl: TableDef* = catalog_get_table(db, table_idx);
+  if (tbl == 0) { return db_exec_fail(1); }
+  if (col_idx == tbl[0].pk_col) {
+    var ref: RowRef;
+    if (index_lookup(db, tbl[0].index_page_id, lit, &ref) != 0) {
+      return db_exec_fail(1);
+    }
+    var buf2: cstring = cache_get_buf(db, ref.heap_page_id);
+    if (buf2 == 0) { return db_exec_fail(4); }
+    var row_id: int64 = 0;
+    var vals: Value[16];
+    var cc: int32 = heap_get_row(buf2, ref.slot, &row_id, tbl[0].col_count, &vals[0]);
+    if (cc < 0) { return db_exec_fail(1); }
+    print("row ");
+    print_int(row_id);
+    print(": ");
+    var i: int32 = 0;
+    while (i < cc) {
+      if (i > 0) { print(", "); }
+      exec_print_value(&vals[i]);
+      i = i + 1;
+    }
+    newline();
+    heap_free_values(cc, &vals[0]);
+    return db_exec_ok(1);
+  }
+  return exec_select_all(db, table_idx);
+}
+
+export function exec_delete(db: Db*, table_idx: int32, pk: Value*) -> DbExecResult {
+  var tbl: TableDef* = catalog_get_table(db, table_idx);
+  if (tbl == 0) { return db_exec_fail(1); }
+  var ref: RowRef;
+  if (index_lookup(db, tbl[0].index_page_id, pk, &ref) != 0) {
+    return db_exec_fail(1);
+  }
+  if (tx_begin(db) != 0) { return db_exec_fail(8); }
+  if (heap_delete_slot(db, ref.heap_page_id, ref.slot) != 0) {
+    tx_abort(db);
+    return db_exec_fail(4);
+  }
+  if (index_delete(db, tbl[0].index_page_id, pk) != 0) {
+    tx_abort(db);
+    return db_exec_fail(4);
+  }
+  tbl[0].row_count = tbl[0].row_count - 1;
+  if (tx_commit(db) != 0) {
+    return db_exec_fail(4);
+  }
+  return db_exec_ok(1);
+}
+
+export function exec_update(db: Db*, table_idx: int32, pk: Value*, col_idx: int32, new_val: Value*) -> DbExecResult {
+  var tbl: TableDef* = catalog_get_table(db, table_idx);
+  if (tbl == 0) { return db_exec_fail(1); }
+  var ref: RowRef;
+  if (index_lookup(db, tbl[0].index_page_id, pk, &ref) != 0) {
+    return db_exec_fail(1);
+  }
+  var buf: cstring = cache_get_buf(db, ref.heap_page_id);
+  if (buf == 0) { return db_exec_fail(4); }
+  var row_id: int64 = 0;
+  var vals: Value[16];
+  var cc: int32 = heap_get_row(buf, ref.slot, &row_id, tbl[0].col_count, &vals[0]);
+  if (cc < 0) { return db_exec_fail(1); }
+  if (col_idx < 0) { return db_exec_fail(8); }
+  if (col_idx >= cc) { return db_exec_fail(8); }
+  value_copy_into(&vals[col_idx], new_val);
+  if (tx_begin(db) != 0) { return db_exec_fail(8); }
+  if (heap_delete_slot(db, ref.heap_page_id, ref.slot) != 0) {
+    tx_abort(db);
+    return db_exec_fail(4);
+  }
+  var slot: int32 = 0;
+  if (heap_insert_row(db, ref.heap_page_id, row_id, cc, &vals[0], &slot) != 0) {
+    tx_abort(db);
+    return db_exec_fail(4);
+  }
+  if (index_delete(db, tbl[0].index_page_id, pk) != 0) {
+    tx_abort(db);
+    return db_exec_fail(4);
+  }
+  if (col_idx == tbl[0].pk_col) {
+    if (index_insert(db, tbl[0].index_page_id, new_val, row_id, ref.heap_page_id, slot) != 0) {
+      tx_abort(db);
+      return db_exec_fail(4);
+    }
+  } else {
+    if (index_insert(db, tbl[0].index_page_id, pk, row_id, ref.heap_page_id, slot) != 0) {
+      tx_abort(db);
+      return db_exec_fail(4);
+    }
+  }
+  heap_free_values(cc, &vals[0]);
+  if (tx_commit(db) != 0) {
+    return db_exec_fail(4);
+  }
+  return db_exec_ok(1);
+}
+
+export function exec_create_table(db: Db*, name: cstring, name_len: int32, col_count: int32, col_names: cstring*, col_name_lens: int32*, col_types: ColumnType*) -> DbExecResult {
+  if (tx_begin(db) != 0) { return db_exec_fail(8); }
+  var err: DbError = catalog_create_table(db, name, name_len, col_count, col_names, col_name_lens, col_types);
+  if (err != 0) {
+    tx_abort(db);
+    return db_exec_fail(err);
+  }
+  if (tx_commit(db) != 0) {
+    return db_exec_fail(4);
+  }
+  return db_exec_ok(0);
+}

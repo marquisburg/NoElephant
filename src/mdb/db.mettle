@@ -1,0 +1,133 @@
+// mdb: public API
+
+import "db_types";
+import "db_io";
+import "db_page";
+import "db_catalog";
+import "db_wal";
+import "db_sql";
+import "std/mem";
+import "std/io";
+import "std/conv";
+
+export function db_error_str(err: DbError) -> cstring {
+  if (err == 0) { return "ok"; }
+  if (err == 1) { return "not found"; }
+  if (err == 2) { return "already exists"; }
+  if (err == 3) { return "corrupt"; }
+  if (err == 4) { return "io error"; }
+  if (err == 5) { return "locked"; }
+  if (err == 6) { return "syntax error"; }
+  if (err == 7) { return "constraint"; }
+  if (err == 8) { return "invalid"; }
+  return "unknown";
+}
+
+export function db_init_paths(db: Db*, dir: cstring, dir_len: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < dir_len) {
+    db[0].dir_path[i] = (uint8)dir[i];
+    i = i + 1;
+  }
+  db[0].dir_path[dir_len] = 0;
+  db[0].dir_len = dir_len;
+  if (db_path_join(dir, dir_len, "data.db", &db[0].data_path[0], 512) < 0) { return -1; }
+  if (db_path_join(dir, dir_len, "data.wal", &db[0].wal_path[0], 512) < 0) { return -1; }
+  if (db_path_join(dir, dir_len, "data.lock", &db[0].lock_path[0], 512) < 0) { return -1; }
+  return 0;
+}
+
+export function db_open(dir: cstring) -> DbOpenResult {
+  var dir_len: int32 = strlen(dir);
+  if (dir_len <= 0) { return db_open_fail(8); }
+  if (db_dir_exists(dir) == 0) {
+    if (db_dir_create(dir) != 0) { return db_open_fail(4); }
+  }
+  var db: Db* = db_alloc();
+  if (db == 0) { return db_open_fail(4); }
+  if (db_init_paths(db, dir, dir_len) != 0) {
+    free((cstring)db);
+    return db_open_fail(4);
+  }
+  if (db_lock_exclusive(&db[0].lock_path[0]) != 0) {
+    free((cstring)db);
+    return db_open_fail(5);
+  }
+  db[0].data_fp = db_open_file(&db[0].data_path[0], 1);
+  if (db[0].data_fp == 0) {
+    db_unlock();
+    free((cstring)db);
+    return db_open_fail(4);
+  }
+  db[0].wal_fp = db_open_file(&db[0].wal_path[0], 1);
+  if (db[0].wal_fp == 0) {
+    db_close_file(db[0].data_fp);
+    db_unlock();
+    free((cstring)db);
+    return db_open_fail(4);
+  }
+  var end: int64 = db_file_size(db[0].data_fp);
+  if (end <= 0) {
+    if (db_init_new(db) != 0) {
+      db_close_file(db[0].data_fp);
+      db_close_file(db[0].wal_fp);
+      db_unlock();
+      free((cstring)db);
+      return db_open_fail(4);
+    }
+    if (catalog_save(db) != 0) {
+      db_close_file(db[0].data_fp);
+      db_close_file(db[0].wal_fp);
+      db_unlock();
+      free((cstring)db);
+      return db_open_fail(4);
+    }
+    if (cache_flush_all(db) != 0) {
+      db_close_file(db[0].data_fp);
+      db_close_file(db[0].wal_fp);
+      db_unlock();
+      free((cstring)db);
+      return db_open_fail(4);
+    }
+  } else {
+    if (catalog_load(db) != 0) {
+      db_close_file(db[0].data_fp);
+      db_close_file(db[0].wal_fp);
+      db_unlock();
+      free((cstring)db);
+      return db_open_fail(3);
+    }
+    var wal_end: int64 = db_file_size(db[0].wal_fp);
+    if (wal_end < 0) { wal_end = 0; }
+    db[0].wal_offset = wal_end;
+    var werr: int32 = wal_scan_validate(db);
+    if (werr == 3) {
+      db_close_file(db[0].data_fp);
+      db_close_file(db[0].wal_fp);
+      db_unlock();
+      free((cstring)db);
+      return db_open_fail(3);
+    }
+  }
+  db[0].in_txn = 0;
+  return db_open_ok(db);
+}
+
+export function db_close(db: Db*) {
+  if (db == 0) { return; }
+  cache_flush_all(db);
+  if (db[0].data_fp != 0) { db_close_file(db[0].data_fp); }
+  if (db[0].wal_fp != 0) { db_close_file(db[0].wal_fp); }
+  db_unlock();
+  db_unlink(&db[0].lock_path[0]);
+  free((cstring)db);
+}
+
+export function db_exec(db: Db*, sql: cstring, sql_len: int32) -> DbExecResult {
+  return sql_exec(db, sql, sql_len);
+}
+
+export function db_checkpoint(db_ptr: Db*) -> DbExecResult {
+  if (wal_checkpoint(db_ptr) != 0) { return db_exec_fail(4); }
+  return db_exec_ok(0);
+}

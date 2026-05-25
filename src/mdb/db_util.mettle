@@ -1,0 +1,67 @@
+// mdb: binary encoding helpers
+
+import "db_types";
+import "std/mem";
+
+export function page_checksum(data: cstring, size: int32) -> uint32 {
+  var hash: uint32 = 2166136261;
+  var i: int32 = 0;
+  while (i < size) {
+    hash = hash ^ (uint32)(uint8)data[i];
+    hash = hash * 16777619;
+    i = i + 1;
+  }
+  return hash;
+}
+
+export function page_init_buf(buf: cstring, page_id: int64, page_type: int32) {
+  var free_off: int32 = db_page_header_size();
+  if (page_type == 2) {
+    free_off = db_page_size();
+  }
+  memset(buf, 0, db_page_size());
+  var b: uint8* = (uint8*)buf;
+  write_u32_le(b, 0, db_page_magic());
+  write_u32_le(b, 4, 0);
+  write_i64_le(b, 8, page_id);
+  write_i32_le(b, 16, page_type);
+  write_u32_le(b, 20, 0);
+  write_i32_le(b, 24, free_off);
+  write_i32_le(b, 28, 0);
+  var csum: uint32 = page_checksum(buf + db_page_header_size(), db_page_size() - db_page_header_size());
+  write_u32_le(b, 20, csum);
+}
+
+export function read_u32_le(b: uint8*, off: int32) -> uint32 {  return (uint32)b[off] | ((uint32)b[off + 1] << 8) | ((uint32)b[off + 2] << 16) | ((uint32)b[off + 3] << 24);
+}
+
+export function read_i32_le(b: uint8*, off: int32) -> int32 {
+  return (int32)read_u32_le(b, off);
+}
+
+export function read_i64_le(b: uint8*, off: int32) -> int64 {
+  var lo: uint64 = (uint64)read_u32_le(b, off);
+  var hi: uint64 = (uint64)read_u32_le(b, off + 4);
+  return (int64)(lo | (hi << 32));
+}
+
+export function write_u32_le(b: uint8*, off: int32, v: uint32) {
+  b[off] = (uint8)(v & 255);
+  b[off + 1] = (uint8)((v >> 8) & 255);
+  b[off + 2] = (uint8)((v >> 16) & 255);
+  b[off + 3] = (uint8)((v >> 24) & 255);
+}
+
+export function write_i32_le(b: uint8*, off: int32, v: int32) {
+  write_u32_le(b, off, (uint32)v);
+}
+
+export function write_i64_le(b: uint8*, off: int32, v: int64) {
+  var u: uint64 = (uint64)v;
+  write_u32_le(b, off, (uint32)(u & 4294967295));
+  write_u32_le(b, off + 4, (uint32)((u >> 32) & 4294967295));
+}
+
+export function write_u8(b: uint8*, off: int32, v: uint8) {
+  b[off] = v;
+}

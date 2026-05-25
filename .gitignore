@@ -1,0 +1,21 @@
+# Local Mettle toolchain (install separately)
+bin/
+
+# Build output
+build/
+*.exe
+*.obj
+*.o
+*.s
+
+# Local database scratch data
+testingdir/
+*.db
+*.wal
+*.lock
+
+# Editor / IDE
+.cursor/
+.vscode/
+*.swp
+*~
