@@ -5,7 +5,6 @@
 
 import "db";
 import "std/io";
-import "std/conv";
 
 export function read_line(buf: cstring, cap: int32) -> int32 {
   var pos: int32 = 0;
@@ -19,6 +18,42 @@ export function read_line(buf: cstring, cap: int32) -> int32 {
   }
   buf[pos] = 0;
   return pos;
+}
+
+export function demo_print_value(val: Value*) {
+  if (val[0].tag == 0) {
+    print("NULL");
+    return;
+  }
+  if (val[0].tag == 1) {
+    print_int(val[0].i64);
+    return;
+  }
+  if (val[0].tag == 2) {
+    var i: int32 = 0;
+    while (i < val[0].text.length) {
+      putchar((int32)(uint8)val[0].text.data[i]);
+      i = i + 1;
+    }
+  }
+}
+
+export function demo_print_rows(result: DbExecResult*) {
+  if (result[0].rows == 0) { return; }
+  var r: int32 = 0;
+  while (r < result[0].count) {
+    print("row ");
+    print_int(result[0].rows[r].row_id);
+    print(": ");
+    var i: int32 = 0;
+    while (i < result[0].rows[r].col_count) {
+      if (i > 0) { print(", "); }
+      demo_print_value(&result[0].rows[r].values[i]);
+      i = i + 1;
+    }
+    newline();
+    r = r + 1;
+  }
 }
 
 export function main(argc: int32, argv: cstring*) -> int32 {
@@ -45,10 +80,12 @@ export function main(argc: int32, argv: cstring*) -> int32 {
       print_err("error: ");
       println_err(db_error_str(result.err));
     } else {
+      demo_print_rows(&result);
       print("ok (");
       print_int(result.count);
       println(" rows)");
     }
+    db_result_free(&result);
   }
   db_close(db);
   return 0;

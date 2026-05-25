@@ -6,6 +6,7 @@ import "db_page";
 import "db_catalog";
 import "db_wal";
 import "db_sql";
+import "db_heap";
 import "std/mem";
 import "std/io";
 import "std/conv";
@@ -125,6 +126,17 @@ export function db_close(db: Db*) {
 
 export function db_exec(db: Db*, sql: cstring, sql_len: int32) -> DbExecResult {
   return sql_exec(db, sql, sql_len);
+}
+
+export function db_result_free(result: DbExecResult*) {
+  if (result[0].rows == 0) { return; }
+  var i: int32 = 0;
+  while (i < result[0].count) {
+    heap_free_values(result[0].rows[i].col_count, &result[0].rows[i].values[0]);
+    i = i + 1;
+  }
+  free((cstring)result[0].rows);
+  result[0].rows = 0;
 }
 
 export function db_checkpoint(db_ptr: Db*) -> DbExecResult {

@@ -6,25 +6,28 @@ import "db_heap";
 import "db_index";
 import "db_page";
 import "db_tx";
-import "std/io";
 import "std/mem";
 
-export function exec_print_value(val: Value*) {
-  if (val[0].tag == 0) {
-    print("NULL");
-    return;
-  }
-  if (val[0].tag == 1) {
-    print_int(val[0].i64);
-    return;
-  }
-  if (val[0].tag == 2) {
-    var i: int32 = 0;
-    while (i < val[0].text.length) {
-      putchar((int32)(uint8)val[0].text.data[i]);
-      i = i + 1;
+function exec_select_fill_rows(buf: cstring, slot_count: int32, col_count: int32, rows: DbRow*) -> int32 {
+  var count: int32 = 0;
+  var slot: int32 = 0;
+  while (slot < slot_count) {
+    var row_id: int64 = 0;
+    var vals: Value[16];
+    var cc: int32 = heap_get_row(buf, slot, &row_id, col_count, &vals[0]);
+    if (cc >= 0) {
+      rows[count].row_id = row_id;
+      db_row_take_values(&rows[count], cc, &vals[0]);
+      count = count + 1;
     }
+    slot = slot + 1;
   }
+  return count;
+}
+
+function exec_select_alloc_rows(count: int32) -> DbRow* {
+  if (count <= 0) { return 0; }
+  return (DbRow*)calloc(count, db_row_size());
 }
 
 export function exec_insert(db: Db*, table_idx: int32, vals: Value*) -> DbExecResult {
@@ -56,29 +59,15 @@ export function exec_select_all(db: Db*, table_idx: int32) -> DbExecResult {
   if (buf == 0) { return db_exec_fail(4); }
   var hdr: PageHeader[1];
   page_header_read(buf, &hdr[0]);
-  var count: int32 = 0;
-  var slot: int32 = 0;
-  while (slot < hdr[0].slot_count) {
-    var row_id: int64 = 0;
-    var vals: Value[16];
-    var cc: int32 = heap_get_row(buf, slot, &row_id, tbl[0].col_count, &vals[0]);
-    if (cc >= 0) {
-      print("row ");
-      print_int(row_id);
-      print(": ");
-      var i: int32 = 0;
-      while (i < cc) {
-        if (i > 0) { print(", "); }
-        exec_print_value(&vals[i]);
-        i = i + 1;
-      }
-      newline();
-      heap_free_values(cc, &vals[0]);
-      count = count + 1;
-    }
-    slot = slot + 1;
+  if (hdr[0].slot_count <= 0) { return db_exec_ok(0); }
+  var rows: DbRow* = exec_select_alloc_rows(hdr[0].slot_count);
+  if (rows == 0) { return db_exec_fail(4); }
+  var filled: int32 = exec_select_fill_rows(buf, hdr[0].slot_count, tbl[0].col_count, rows);
+  if (filled <= 0) {
+    free((cstring)rows);
+    return db_exec_ok(0);
   }
-  return db_exec_ok(count);
+  return db_exec_select(rows, filled);
 }
 
 export function exec_select_where(db: Db*, table_idx: int32, col_idx: int32, lit: Value*) -> DbExecResult {
@@ -95,18 +84,14 @@ export function exec_select_where(db: Db*, table_idx: int32, col_idx: int32, lit
     var vals: Value[16];
     var cc: int32 = heap_get_row(buf2, ref.slot, &row_id, tbl[0].col_count, &vals[0]);
     if (cc < 0) { return db_exec_fail(1); }
-    print("row ");
-    print_int(row_id);
-    print(": ");
-    var i: int32 = 0;
-    while (i < cc) {
-      if (i > 0) { print(", "); }
-      exec_print_value(&vals[i]);
-      i = i + 1;
+    var rows: DbRow* = exec_select_alloc_rows(1);
+    if (rows == 0) {
+      heap_free_values(cc, &vals[0]);
+      return db_exec_fail(4);
     }
-    newline();
-    heap_free_values(cc, &vals[0]);
-    return db_exec_ok(1);
+    rows[0].row_id = row_id;
+    db_row_take_values(&rows[0], cc, &vals[0]);
+    return db_exec_select(rows, 1);
   }
   return exec_select_all(db, table_idx);
 }

@@ -137,9 +137,37 @@ export function value_copy_into(dst: Value*, src: Value*) {
   }
 }
 
+export struct DbRow {
+  row_id: int64;
+  col_count: int32;
+  values: Value[16];
+}
+
 export struct DbExecResult {
   err: DbError;
   count: int32;
+  rows: DbRow*;
+}
+
+export function db_row_size() -> int64 {
+  // row_id(8) + col_count(4) + pad(4) + Value[16](512) on x86-64
+  return 528;
+}
+
+export function db_row_take_values(row: DbRow*, cc: int32, vals: Value*) {
+  row[0].col_count = cc;
+  var i: int32 = 0;
+  while (i < cc) {
+    row[0].values[i].tag = vals[i].tag;
+    row[0].values[i].i64 = vals[i].i64;
+    row[0].values[i].text.data = vals[i].text.data;
+    row[0].values[i].text.length = vals[i].text.length;
+    vals[i].tag = 0;
+    vals[i].i64 = 0;
+    vals[i].text.data = 0;
+    vals[i].text.length = 0;
+    i = i + 1;
+  }
 }
 
 export struct TableDef {
@@ -200,6 +228,15 @@ export function db_exec_ok(count: int32) -> DbExecResult {
   var r: DbExecResult;
   r.err = 0;
   r.count = count;
+  r.rows = 0;
+  return r;
+}
+
+export function db_exec_select(rows: DbRow*, count: int32) -> DbExecResult {
+  var r: DbExecResult;
+  r.err = 0;
+  r.count = count;
+  r.rows = rows;
   return r;
 }
 
@@ -207,6 +244,7 @@ export function db_exec_fail(err: DbError) -> DbExecResult {
   var r: DbExecResult;
   r.err = err;
   r.count = 0;
+  r.rows = 0;
   return r;
 }
 
